@@ -1,0 +1,289 @@
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "stdio.h"
+#include "stdbool.h"
+#include "stdlib.h"
+#include "string.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+#define PPR_channel_A 7 //(PPR: pulse per round)
+#define PPR_channel_B 7
+
+#define pi 3.1415
+#define p2r pi/2000
+
+#define PCF_ADDRESS (0x27<<1) // HAL suck need to shift left by 1 unlike raspberry
+#define ENABLE_BITS 0x04
+#define RS 0x01
+#define BACK_LIGHT 0x08
+
+#define IR true
+#define DR false
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+
+TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim3;
+
+/* USER CODE BEGIN PV */
+char buffer[20];
+
+bool dir;
+bool run = false;
+
+float CurPos = 0;
+float DesiredPos;
+float CurVel;
+
+uint8_t PreviousState; // doc trang thai encoder
+uint8_t pwm;
+uint8_t SpeedMode;
+uint8_t tick;
+
+uint16_t CntVel;
+
+int16_t speed;
+int16_t CountValue = 0;
+int16_t RealVel;
+int16_t DesiredSpeed;
+int16_t HILIM = 100, LOLIM = 0; // rated speed: don't know yet
+
+int32_t PosCnt;
+int32_t Cnttmp;
+
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_TIM2_Init(void);
+static void MX_TIM3_Init(void);
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/*the data send sequence for LCD HD44870 are: [D7, D6, D5, D4, BackLight, Enable, RW, RS] */
+
+void send_data(uint8_t data){
+	HAL_I2C_Master_Transmit(&hi2c1, PCF_ADDRESS, &data, 1, HAL_MAX_DELAY);
+}
+
+void instruction_register_write_4bits(uint8_t data){
+	send_data(data|BACK_LIGHT);
+	send_data(data|ENABLE_BITS|BACK_LIGHT);
+	HAL_Delay(1);
+	send_data((data&~ENABLE_BITS)|BACK_LIGHT);
+}
+
+void data_register_write(uint8_t data){
+	send_data(data|RS|BACK_LIGHT);
+	send_data(data|RS|ENABLE_BITS|BACK_LIGHT);
+	HAL_Delay(1);
+	send_data((data|RS)&~ENABLE_BITS|BACK_LIGHT);
+}
+
+void send_byte(uint8_t data_frame, bool IR_or_DR){
+		uint8_t upper_bits = data_frame & 0xF0;
+		uint8_t lower_bits = (data_frame<<4) & 0xF0;
+		if (IR_or_DR == IR){
+			instruction_register_write_4bits(upper_bits);
+			instruction_register_write_4bits(lower_bits);
+		}
+		else {
+			data_register_write(upper_bits);
+			data_register_write(lower_bits);
+		}
+}
+
+void LCD_init(){
+	// LCD init:
+	HAL_Delay(50);
+	// Force into 4-bit mode (send 0x30 3 times, then 0x20)
+  instruction_register_write_4bits(0x30);
+  HAL_Delay(5);
+  instruction_register_write_4bits(0x30);
+  HAL_Delay(5);
+  instruction_register_write_4bits(0x30);
+  HAL_Delay(5);
+  instruction_register_write_4bits(0x20); // set 4-bit mode
+
+	// Function set: 4-bit, 2 lines, 5x8 dots
+  send_byte(0x28, IR);
+  // Display ON, cursor OFF, blink OFF
+  send_byte(0x0C, IR);
+  // Clear display
+  send_byte(0x01, IR);
+  HAL_Delay(2);
+  // Entry mode: increment cursor
+  send_byte(0x06, IR);
+  // Set DDRAM address to 0x00 (first line, first char)
+  send_byte(0x80, IR);
+}
+
+void write_data(uint8_t row, uint8_t collum ,char *str){
+	uint8_t DDRAM_address;
+	
+	switch (row){
+		case 1: DDRAM_address = 0x80 + collum; 
+			break;
+		case 2: DDRAM_address = 0x80 + 20 + collum; 
+			break;
+		case 3: DDRAM_address = 0x80 + 40 + collum; 
+			break;
+		case 4: DDRAM_address = 0x80 + 60 + collum; 
+			break;
+	}
+	
+	send_byte(DDRAM_address, IR);
+	
+	while(*str){
+		send_byte(*str, DR);
+		str++;
+	}
+}
+
+void dynamic_display(){
+	sprintf(buffer,"speed: %3dRPM" ,speed);
+	write_data(1,0,buffer);
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+	
+	//////////////////////////////////////////////////////////
+	// 
+	// 	compiled->load code in stm32-> open debug tab -> 
+	// 	select these variables to watch 1, remember to turn off hex value display:
+	// 	DesiredPos
+	// 	CurPos
+	// 	run
+	// 	CntVel
+	// 	CountValue
+	// 	RealVel
+	// 	pwm
+	//	CurVel
+	//	DesiredSpeed
+	//////////////////////////////////////////////////////////
+	
+	if(htim->Instance==TIM2)	// ngat do timer 2	5ms
+	{
+		/* angular velocity formula: 
+			speed = 2pi*M/N*T [rad/s] = 60*M/N*T [RPM] 
+		
+		N: encoder resolution base on the encoder mode (x1, x2, x4)
+		M: pulse counted when timer interrupt or pulse counted during the timer period
+		T: sample time, timer period
+		*/ 
+		CurPos = PosCnt*2*pi+CountValue*p2r;	// Position calculation by rad
+		Cnttmp = CntVel;
+		CntVel = 0;
+		RealVel = Cnttmp*3;										//RPM // do bang rad/s
+		CurVel = Cnttmp*pi/10;								//rad/s
+		
+		//pwm = PIDVel(DesiredSpeed,CurVel);
+		
+		if (dir==1){
+				// CW
+				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);
+				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_RESET);
+			__HAL_TIM_SetCompare(&htim3,TIM_CHANNEL_3,pwm); 	// set pwm dieu khien dong co
+		}
+		else {
+				//CCW
+				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);
+				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_SET);
+			__HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_3,pwm); // set pwm
+		}	
+		return;
+	}
+	if(htim->Instance==TIM3)
+	{
+			tick++;
+			if (run==0){ 
+					pwm = 0;
+					SpeedMode =0;
+			}
+			else if ((run==1)&&(tick==5)){
+				tick=0;
+				printf("V%f\r \n",CurVel); // transfer CurVel through UART
+				printf("P%f\r \n",CurPos); // truyen CurPos qua chan UART
+			}
+	}
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_I2C1_Init();
+  MX_TIM2_Init();
+  MX_TIM3_Init();
+  /* USER CODE BEGIN 2 */
+	HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);	// khoi tao timer 3 CH3 pwm
+	LCD_init();
+	
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+		dynamic_display();
+		HAL_Delay(1000);
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
